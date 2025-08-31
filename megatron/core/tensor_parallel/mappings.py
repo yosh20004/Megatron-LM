@@ -85,12 +85,23 @@ def _gather_along_last_dim(input_, group):
     if world_size == 1:
         return input_
 
+    # 准备输出缓冲区
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
+    # 准备num_gpu倍于之前的output_buffer
     output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+
+    # 调用all-gather操作原语 (进入torch领域)
     dist_all_gather_func(output, input_.contiguous(), group=group)
+
+    # 拼接 每个GPU都获得了全部的input_矩阵
     tensor_list = output.chunk(world_size, dim=0)
+
+    # 按照最后一维(列)进行拼接
+    # X @ [W1 W2 W3 ... Wm] -> [Y1 Y2 Y3 ... Ym]
+    # GPU_i 计算出 Y_i 之后，all-gather聚合
+    # 随后按照列进行拼接得到完整Y
     output = torch.cat(tensor_list, dim=-1).contiguous()
 
     return output
@@ -265,6 +276,8 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
+
+        # 封装了一个all-gather操作
         return _gather_along_last_dim(input_, group)
 
     @staticmethod

@@ -824,6 +824,8 @@ class ColumnParallelLinear(torch.nn.Module):
         world_size = get_pg_size(self.tp_group)
         rank = get_pg_rank(self.tp_group)
         self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
+        
+        # 按列切分tensor (原因: 类名ColumnParallelLinear)
         self.output_size_per_partition = divide(output_size, world_size)
 
         # Parameters.
@@ -936,6 +938,7 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
+    # 向前传播
     def forward(
         self,
         input_: torch.Tensor,
@@ -966,6 +969,8 @@ class ColumnParallelLinear(torch.nn.Module):
             weight = self.weight
         else:
             # Check the weight passed in is the correct shape
+            # self.output_size_per_partition = self.output_size / GPU数量 即单个GPU要输出的列数
+            # Y = X @ W^T + b 每个GPU都得到完整的X 而得到的W按列分割
             expected_shape = (self.output_size_per_partition, self.input_size)
             if weight.shape != expected_shape:
                 raise RuntimeError(
@@ -973,8 +978,10 @@ class ColumnParallelLinear(torch.nn.Module):
                     f"not {expected_shape} as expected"
                 )
 
+        # Y = X @ W^T + b (b = self.bias)
         bias = self.bias if not self.skip_bias_add else None
 
+        # 除非某些特殊模式 否则启动张量并行
         if (
             self.allreduce_dgrad
             or self.sequence_parallel
@@ -983,6 +990,8 @@ class ColumnParallelLinear(torch.nn.Module):
         ):
             input_parallel = input_
         else:
+            # 前向传播 : 不做操作 各GPU接收一份同样的input_矩阵
+            # 反向传播 : 插入all-reduce同步点
             input_parallel = copy_to_tensor_model_parallel_region(input_, group=self.tp_group)
 
         if self.config.defer_embedding_wgrad_compute:
@@ -992,7 +1001,7 @@ class ColumnParallelLinear(torch.nn.Module):
             ):
                 self.embedding_activation_buffer.append(input_parallel)
 
-        # Matrix multiply.
+        # Matrix multiply. 配置
         allreduce_dgrad = False if self.explicit_expert_comm else self.allreduce_dgrad
 
         if self.config._cpu_offloading_context is not None:
@@ -1002,8 +1011,11 @@ class ColumnParallelLinear(torch.nn.Module):
                         self.config.cpu_offloading is False
                     ), "CPU Offloading cannot be enabled while TE is not present"
                 else:
+                    # 决定是否将权重卸载到CPU
+                    # 卸载后，部分层的权重离开显存，而他们暂时用不到，要到下一次正向传播或是反向传播到本层的时候，该层权重才有用
                     input_parallel.activation_offloading = self.config.cpu_offloading_activations
 
+        # Matrix multiply. 计算
         output_parallel = self._forward_impl(
             input=input_parallel,
             weight=weight,
@@ -1022,13 +1034,18 @@ class ColumnParallelLinear(torch.nn.Module):
             tp_group=self.tp_group,
         )
 
+        # 决定是否要gather各个GPU的输出
         gather_output = self.gather_output
+
         # Use the runtime gather output if it's set explicitly.
+        # 可以在运行时动态指定是否聚合
         if runtime_gather_output is not None:
             gather_output = runtime_gather_output
 
+        # 如果决定聚合 各个tensor进行一个all-gather操作
         if gather_output:
             # All-gather across the partitions.
+            # 内部封装了forward和backward的操作
             output = gather_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
         else:
             output = output_parallel
