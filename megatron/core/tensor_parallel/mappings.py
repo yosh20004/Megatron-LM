@@ -488,6 +488,7 @@ def copy_to_tensor_model_parallel_region(input_, group=None):
 def reduce_from_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: all reduce, backward copy"""
     group = get_tensor_model_parallel_group_if_none(group)
+    # 这里有all-reduce原语
     return _ReduceFromModelParallelRegion.apply(input_, group)
 
 

@@ -108,19 +108,23 @@ class ParallelMLP(MegatronModule):
         args = get_args()
 
         self.add_bias = config.add_bias_linear
-
+        # 这里没太看懂
         ffn_hidden_size = config.ffn_hidden_size
         if config.gated_linear_unit:
             ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        # self.dense_h_to_4h.weight 即W1 是一个张量
+        # 这里决定了W1张量切分的方式 (按列切分)
+        # 可以理解为tensor_parallel.ColumnParallelLinear决定了这是一个按列切分的层，并在类中决定了output如何计算，weight如何切分等信息
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             config.hidden_size,
             ffn_hidden_size,
             config=config,
             init_method=config.init_method,
             bias=self.add_bias,
-            gather_output=False,
+            gather_output=False, # 细节不做all-gather
+                                 # 因为接下来还要4h->h 省去一个all-gather同步点
             skip_bias_add=True,
             is_expert=is_expert,
         )
@@ -129,6 +133,7 @@ class ParallelMLP(MegatronModule):
         self.activation_func = None
         self.swiglu = args.swiglu
 
+        # 不同版本的Gelu激活函数 由配置决定
         if args.openai_gelu:
             self.activation_func = openai_gelu
         elif args.onnx_safe:
@@ -147,6 +152,8 @@ class ParallelMLP(MegatronModule):
             self.activation_func = F.gelu
 
         # Project back to h.
+        # 和self.dense_h_to_4h类似，分别是h->4h和4h->h
+        # 按行切分
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
             config.ffn_hidden_size,
             config.hidden_size,
@@ -161,8 +168,10 @@ class ParallelMLP(MegatronModule):
     def forward(self, hidden_states):
 
         # [s, b, 4hp]
+        # 这里调用了self.dense_h_to_4h的forward方法
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
+        # 这里根据配置决定是否使用bias_gelu_impl
         if self.bias_gelu_fusion:
             assert self.add_bias is True
             assert self.activation_func == F.gelu
@@ -173,7 +182,14 @@ class ParallelMLP(MegatronModule):
             intermediate_parallel = self.activation_func(intermediate_parallel)
 
         # [s, b, h]
+        # 这里调用了self.dense_4h_to_h的forward方法
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+
+        # 备注:
+        # dense_h_to_4h / gelu / dense_4h_to_h 这三个阶段的函数都是在init里准备好的
+        # 其中h_to_4h 和 4h_to_h 做了切分，在4h_to_h后做了all-reduce同步
+        # forward仅仅是把init里初始化好的函数串联起来
+
         return output, output_bias
 
 def sinkhorn(cost, tol=0.0001):
@@ -538,6 +554,7 @@ class ParallelAttention(MegatronModule):
         else:
             kv_projection_size = args.kv_channels * args.num_attention_heads
 
+        # 决定是否能使用flash attention
         self.use_flash_attn = args.use_flash_attn \
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
@@ -553,22 +570,42 @@ class ParallelAttention(MegatronModule):
                 raise ImportError('einops is not installed, please install with pip install einops')
 
         # Per attention head and per partition values.
-        world_size = mpu.get_tensor_model_parallel_world_size()
-        self.hidden_size_per_attention_head = core.utils.divide(
+        world_size = mpu.get_tensor_model_parallel_world_size()     # 总卡数
+        self.hidden_size_per_attention_head = core.utils.divide(    # 每个注意力头的维度
             query_projection_size, config.num_attention_heads)
-        self.num_attention_heads_per_partition = core.utils.divide(
+        self.num_attention_heads_per_partition = core.utils.divide( # 每张卡分到的注意力头数量
             config.num_attention_heads, world_size)
 
+        # group_query_attention = GQA = 分组查询注意力
+        # 分组查询注意力 即不同的Q可能对应同一组K,V
         if self.group_query_attention:
+            # 如果有分组查询注意力，则组数需要能够被总卡数整除
             if args.num_query_groups % world_size != 0:
                 raise NotImplementedError('Currently the num_query_groups should be '
                                           'a multiple of the tensor parallel size')
+                
+            # 使用GQA时 单卡的Q组数 = 总Q组数 / 总卡数
             self.num_query_groups_per_partition = core.utils.divide(
                         args.num_query_groups, world_size)
         else:
+            # 不使用GQA时 单卡的Q组数 = 单卡的注意力头数 (即一个Q对应一个K,V)
             self.num_query_groups_per_partition = self.num_attention_heads_per_partition
 
+
+
         # Strided linear layer.
+        """
+        attention有三种分类
+        - self-attention : 就是存在于encoder和decoder中的最经典的注意力
+        - musked self-attention : 存在于decoder中，屏蔽掉未来的信息，常见于llm
+        - cross-attention : 存在于encoder-decoder结构的decoder中，query来自decoder，key和value来自encoder
+                            纯文本的llm不用 但是在多模态模型中会用到
+                            
+        * 注意 : 这里仅是拼接了query, key, value
+        """
+        # 自注意力 (self-attention)
+        # 自注意力的QKV来自同一层 所以可以充分混合
+        # 混合后形式: [Q|K|V] [Q|K|V] ... 按列切分给不同GPU
         if attention_type == AttnType.self_attn:
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
@@ -577,6 +614,10 @@ class ParallelAttention(MegatronModule):
                 init_method=config.init_method,
                 bias=args.add_bias_linear or args.add_qkv_bias,
                 gather_output=False)
+            
+        # 交叉注意力 (cross-attention)
+        # 交叉注意力的Q来自decoder，K和V来自encoder 不能直接混合给同一个张量
+        # 需要用两个线性层分别处理
         else:
             assert attention_type == AttnType.cross_attn
 
@@ -600,6 +641,8 @@ class ParallelAttention(MegatronModule):
                 bias=config.add_bias_linear,
                 gather_output=False)
 
+        # 决定使用哪种注意力计算方法
+        # 如果使用flash attention 则不使用core attention
         self.core_attention = CoreAttention(self.layer_number, config,
                                             self.attn_mask_type)
         self.checkpoint_core_attention = (
@@ -607,6 +650,7 @@ class ParallelAttention(MegatronModule):
             and "core_attn" in config.recompute_modules
         )
 
+        # 如果使用flash attention 则不使用core attention 不过后者仍然会被实例化出来 但无用
         if self.use_flash_attn:
             self.core_attention_flash = FlashSelfAttention(
                 causal=True, attention_dropout=config.attention_dropout
@@ -659,6 +703,8 @@ class ParallelAttention(MegatronModule):
                 rotary_pos_emb=None, *, inference_params=None):
         # hidden_states: [sq, b, h]
 
+        # inference_params 即将被废弃
+        # 统一使用inference_context
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =================================================

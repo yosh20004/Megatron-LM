@@ -1277,10 +1277,12 @@ class RowParallelLinear(torch.nn.Module):
             assert self.skip_bias_add
             output_ = output_parallel
         elif self.sequence_parallel:
+            # 如果启用了序列并行 则使用reduce-scatter
             output_ = reduce_scatter_to_sequence_parallel_region(
                 output_parallel, group=self.tp_group
             )
         else:
+            # 如果没有启用 则进行普通的all-reduce
             output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
         if not self.skip_bias_add:
             output = (output_ + self.bias) if self.bias is not None else output_
